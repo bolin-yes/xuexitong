@@ -1,0 +1,628 @@
+
+// ==UserScript==
+// @name         学习通视频助手 3.4
+// @namespace    chaoxing-video-helper
+// @version      3.4.0
+// @description  学习通视频后台播放、章节识别与自动导航
+// @match        *://mooc1.xuexitong.com/*
+// @match        *://*.chaoxing.com/*
+// @match        *://*.xuexitong.com/*
+// @run-at       document-idle
+// @grant        none
+// ==/UserScript==
+
+(() => {
+    'use strict';
+
+    if (window.top !== window.self) return;
+    if (window.__cx34_running) return;
+    window.__cx34_running = true;
+
+    const CONFIG = {
+        autoPlay: true,
+        autoNext: true,
+        speed: 2.0,
+        zeroWait: 2500,
+        checkInterval: 1000,
+        switchTimeout: 15000
+    };
+
+    let currentLessonId = null;
+    let switching = false;
+    let expectedLessonId = null;
+    let zeroTimer = null;
+    let switchTimer = null;
+    let currentVideo = null;
+    let panel = null;
+    let manualPause = false;
+
+    const boundVideos = new WeakSet();
+    const guardedWindows = new WeakSet();
+    const videoStates = new WeakMap();
+
+    const $ = id => document.getElementById(id);
+
+    // ==============================
+    // 章节识别
+    // ==============================
+
+    function getLessons() {
+        return [...document.querySelectorAll(
+            '.posCatalog_level .posCatalog_select'
+        )];
+    }
+
+    function getCurrent() {
+        return document.querySelector(
+            '.posCatalog_level .posCatalog_select.posCatalog_active'
+        );
+    }
+
+    function getName(el) {
+        return el?.querySelector('.posCatalog_name')
+            ?.innerText.trim() || '未知章节';
+    }
+
+    function getLessonId(el) {
+        return el?.id || null;
+    }
+
+    // ==============================
+    // 任务点识别
+    // ==============================
+
+    function getTaskCount(el) {
+        if (!el) return null;
+
+        const orange = el.querySelector(
+            '.catalog_points_yi .orangeNew'
+        );
+
+        if (orange) {
+            const value = orange.textContent.trim();
+            if (/^\d+$/.test(value)) return Number(value);
+        }
+
+        const hidden = el.querySelector('.jobUnfinishCount');
+
+        if (hidden && /^\d+$/.test(hidden.value)) {
+            return Number(hidden.value);
+        }
+
+        return null;
+    }
+
+    // ==============================
+    // 递归寻找视频
+    // ==============================
+
+    function getVideo() {
+        const visited = new Set();
+
+        function scan(win) {
+            try {
+                if (!win || visited.has(win)) return null;
+                visited.add(win);
+
+                const doc = win.document;
+
+                const videos = [
+                    ...doc.querySelectorAll('video.vjs-tech, video')
+                ];
+
+                const visible = videos.filter(v => {
+                    const r = v.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                });
+
+                if (visible.length) return visible[0];
+
+                for (const frame of doc.querySelectorAll('iframe')) {
+                    const result = scan(frame.contentWindow);
+                    if (result) return result;
+                }
+            } catch (e) {}
+
+            return null;
+        }
+
+        return scan(window);
+    }
+
+    // ==============================
+    // 后台暂停拦截
+    // ==============================
+
+    function installPauseGuard(video) {
+        if (!video) return;
+
+        const win = video.ownerDocument.defaultView;
+        const doc = video.ownerDocument;
+
+        if (!win || !win.HTMLMediaElement) return;
+
+        let state = videoStates.get(video);
+
+        if (!state) {
+            state = {
+                pointerInside: false,
+                allowPause: false
+            };
+            videoStates.set(video, state);
+        }
+
+        // 追踪鼠标是否位于视频区域
+        if (!video.__cx34_pointerBound) {
+            video.__cx34_pointerBound = true;
+
+            const updatePointer = e => {
+                const r = video.getBoundingClientRect();
+
+                state.pointerInside =
+                    e.clientX >= r.left &&
+                    e.clientX <= r.right &&
+                    e.clientY >= r.top &&
+                    e.clientY <= r.bottom;
+            };
+
+            doc.addEventListener('pointermove', updatePointer, true);
+
+            doc.addEventListener('pointerleave', () => {
+                state.pointerInside = false;
+            }, true);
+
+            video.addEventListener('pointerenter', () => {
+                state.pointerInside = true;
+            }, true);
+
+            video.addEventListener('pointerleave', () => {
+                state.pointerInside = false;
+            }, true);
+        }
+
+        // 每个 iframe 的媒体原型只修改一次
+        if (!guardedWindows.has(win)) {
+            guardedWindows.add(win);
+
+            const proto = win.HTMLMediaElement.prototype;
+            const originalPause = proto.pause;
+
+            proto.pause = function () {
+                const s = videoStates.get(this);
+
+                if (
+                    this.tagName === 'VIDEO' &&
+                    s &&
+                    !s.allowPause &&
+                    !this.ended
+                ) {
+                    let background = false;
+
+                    try {
+                        background =
+                            this.ownerDocument.visibilityState === 'hidden' ||
+                            !this.ownerDocument.hasFocus();
+                    } catch (e) {}
+
+                    const mouseOutside = !s.pointerInside;
+
+                    // 仅拦截后台失焦或鼠标离开时的暂停
+                    if (background || mouseOutside) {
+                        console.debug(
+                            '[学习通助手] 已拦截后台暂停',
+                            background ? '后台/失焦' : '鼠标离开视频'
+                        );
+                        return;
+                    }
+                }
+
+                return originalPause.apply(this, arguments);
+            };
+        }
+    }
+
+    // ==============================
+    // 状态显示
+    // ==============================
+
+    function setStatus(message) {
+        const el = $('cx34-status');
+        if (el) el.textContent = message;
+    }
+
+    function updateInfo() {
+        const current = getCurrent();
+        if (!current) return;
+
+        const count = getTaskCount(current);
+
+        $('cx34-name').textContent =
+            '当前章节：' + getName(current);
+
+        $('cx34-task').textContent =
+            '任务点：' + (count === null ? '未识别' : count);
+
+        const video = getVideo();
+
+        if (video && video.duration) {
+            const percent = (
+                video.currentTime / video.duration * 100
+            ).toFixed(1);
+
+            $('cx34-progress').textContent =
+                '播放进度：' + percent + '%';
+        } else {
+            $('cx34-progress').textContent = '播放进度：--';
+        }
+    }
+
+    // ==============================
+    // 下一章节
+    // ==============================
+
+    function getNextLesson() {
+        const lessons = getLessons();
+        const current = getCurrent();
+        const index = lessons.indexOf(current);
+
+        if (index < 0) return null;
+        return lessons[index + 1] || null;
+    }
+
+    function goNextLesson() {
+        if (switching) return;
+
+        if (!CONFIG.autoNext) {
+            setStatus('自动切换已关闭');
+            return;
+        }
+
+        const next = getNextLesson();
+
+        if (!next) {
+            setStatus('已经到达最后一个章节');
+            return;
+        }
+
+        const target = next.querySelector('.posCatalog_name');
+
+        if (!target) {
+            setStatus('没有找到章节点击入口');
+            return;
+        }
+
+        expectedLessonId = getLessonId(next);
+        switching = true;
+
+        clearTimeout(zeroTimer);
+        clearTimeout(switchTimer);
+
+        setStatus('正在进入：' + getName(next));
+
+        target.click();
+
+        switchTimer = setTimeout(() => {
+            if (getLessonId(getCurrent()) !== expectedLessonId) {
+                switching = false;
+                expectedLessonId = null;
+                setStatus('章节切换超时，请检查页面');
+            }
+        }, CONFIG.switchTimeout);
+    }
+
+    // ==============================
+    // 视频事件
+    // ==============================
+
+    function bindVideo(video) {
+        if (!video || boundVideos.has(video)) return;
+
+        boundVideos.add(video);
+
+        video.addEventListener('playing', () => {
+            setStatus('视频正在播放');
+        });
+
+        video.addEventListener('waiting', () => {
+            setStatus('视频缓冲中...');
+        });
+
+        video.addEventListener('pause', () => {
+            if (!video.ended) {
+                setStatus('视频已暂停');
+            }
+        });
+
+        video.addEventListener('ended', () => {
+            const current = getCurrent();
+            if (!current) return;
+
+            const count = getTaskCount(current);
+            if (count === null || count <= 0) return;
+
+            setStatus('视频自然播放结束');
+
+            if (CONFIG.autoNext) {
+                setTimeout(() => {
+                    if (
+                        getCurrent() === current &&
+                        video.ended
+                    ) {
+                        goNextLesson();
+                    }
+                }, 1500);
+            }
+        });
+
+        video.addEventListener('error', () => {
+            setStatus('播放器发生错误');
+        });
+    }
+
+    // ==============================
+    // 播放控制
+    // ==============================
+
+    function playVideo() {
+        const video = getVideo();
+
+        if (!video) {
+            setStatus('没有找到视频播放器');
+            return;
+        }
+
+        installPauseGuard(video);
+        bindVideo(video);
+
+        video.playbackRate = CONFIG.speed;
+
+        video.play().then(() => {
+            setStatus('正在播放');
+        }).catch(() => {
+            setStatus('播放被浏览器阻止，请检查播放器');
+        });
+    }
+
+    function pauseVideo() {
+        const video = getVideo();
+
+        if (!video) {
+            setStatus('没有找到视频播放器');
+            return;
+        }
+
+        const state = videoStates.get(video);
+
+        if (state) state.allowPause = true;
+
+        try {
+            video.pause();
+        } finally {
+            if (state) state.allowPause = false;
+        }
+
+        setStatus('已手动暂停');
+    }
+
+    // ==============================
+    // 倍速
+    // ==============================
+
+    function changeSpeed(delta) {
+        CONFIG.speed = Math.max(
+            0.5,
+            Math.min(3, CONFIG.speed + delta)
+        );
+
+        CONFIG.speed = Math.round(CONFIG.speed * 100) / 100;
+
+        $('cx34-speed').textContent = CONFIG.speed + 'x';
+
+        const video = getVideo();
+
+        if (video) video.playbackRate = CONFIG.speed;
+
+        setStatus('播放速度：' + CONFIG.speed + 'x');
+    }
+
+    // ==============================
+    // 控制面板
+    // ==============================
+
+    function createPanel() {
+        if ($('cx34-panel')) return;
+
+        panel = document.createElement('div');
+        panel.id = 'cx34-panel';
+
+        Object.assign(panel.style, {
+            position: 'fixed',
+            right: '20px',
+            bottom: '25px',
+            width: '260px',
+            padding: '14px',
+            background: '#20242c',
+            color: '#fff',
+            borderRadius: '12px',
+            zIndex: '2147483647',
+            fontSize: '13px',
+            lineHeight: '1.8',
+            boxShadow: '0 4px 18px #0006',
+            boxSizing: 'border-box'
+        });
+
+        panel.innerHTML = `
+            <div style="font-size:16px;font-weight:bold">
+                学习通视频助手 3.4
+            </div>
+
+            <div id="cx34-status"
+                 style="color:#56d6b0;margin-top:6px">
+                正在初始化...
+            </div>
+
+            <div id="cx34-name"
+                 style="margin-top:10px;word-break:break-all">
+                当前章节：--
+            </div>
+
+            <div id="cx34-task">任务点：--</div>
+            <div id="cx34-progress">播放进度：--</div>
+
+            <hr style="opacity:.2">
+
+            <div>
+                <button id="cx34-play">播放</button>
+                <button id="cx34-pause">暂停</button>
+            </div>
+
+            <div style="margin-top:8px">
+                <button id="cx34-down">减速</button>
+                <span id="cx34-speed">2x</span>
+                <button id="cx34-up">加速</button>
+            </div>
+
+            <div style="margin-top:10px">
+                <button id="cx34-next">下一章节</button>
+            </div>
+
+            <div style="margin-top:10px">
+                <button id="cx34-toggle">暂停自动导航</button>
+            </div>
+
+            <div style="font-size:11px;color:#aaa;margin-top:8px">
+                后台播放保护与章节导航
+            </div>
+        `;
+
+        document.body.appendChild(panel);
+
+        $('cx34-play').onclick = playVideo;
+        $('cx34-pause').onclick = pauseVideo;
+
+        $('cx34-down').onclick = () => changeSpeed(-0.25);
+        $('cx34-up').onclick = () => changeSpeed(0.25);
+
+        $('cx34-next').onclick = goNextLesson;
+
+        $('cx34-toggle').onclick = () => {
+            CONFIG.autoNext = !CONFIG.autoNext;
+
+            $('cx34-toggle').textContent =
+                CONFIG.autoNext ? '暂停自动导航' : '开启自动导航';
+
+            setStatus(
+                CONFIG.autoNext ? '自动导航已开启' : '自动导航已暂停'
+            );
+
+            if (!CONFIG.autoNext) clearTimeout(zeroTimer);
+        };
+    }
+
+    // ==============================
+    // 主监控
+    // ==============================
+
+    function monitor() {
+        const current = getCurrent();
+
+        if (!current) {
+            setStatus('等待课程目录加载...');
+            return;
+        }
+
+        const lessonId = getLessonId(current);
+
+        if (switching) {
+            if (lessonId === expectedLessonId) {
+                switching = false;
+                expectedLessonId = null;
+
+                clearTimeout(switchTimer);
+                currentVideo = null;
+
+                setStatus('章节已切换，正在加载');
+            } else {
+                return;
+            }
+        }
+
+        updateInfo();
+
+        if (lessonId !== currentLessonId) {
+            currentLessonId = lessonId;
+            currentVideo = null;
+
+            clearTimeout(zeroTimer);
+
+            const count = getTaskCount(current);
+
+            if (count === null) {
+                setStatus('任务点无法识别，请勿自动跳过');
+                return;
+            }
+
+            if (count === 0) {
+                setStatus('0任务点章节：正在访问');
+
+                if (CONFIG.autoNext) {
+                    zeroTimer = setTimeout(() => {
+                        if (
+                            getCurrent() === current &&
+                            !switching
+                        ) {
+                            goNextLesson();
+                        }
+                    }, CONFIG.zeroWait);
+                }
+
+                return;
+            }
+
+            if (count > 0) {
+                setStatus('任务点 ' + count + '：正常播放');
+            }
+        }
+
+        const count = getTaskCount(current);
+
+        if (count === null || count === 0) return;
+
+        const video = getVideo();
+
+        if (!video) {
+            setStatus('等待视频播放器加载...');
+            return;
+        }
+
+        currentVideo = video;
+
+        installPauseGuard(video);
+        bindVideo(video);
+
+        video.playbackRate = CONFIG.speed;
+
+        // 自动播放；后台暂停保护由 pause 拦截器负责
+        if (
+            CONFIG.autoPlay &&
+            video.paused &&
+            !video.ended
+        ) {
+            video.play().catch(() => {
+                setStatus('自动播放受限，请手动点击播放');
+            });
+        }
+    }
+
+    // ==============================
+    // 初始化
+    // ==============================
+
+    createPanel();
+
+    setStatus('助手已启动，等待课程加载');
+
+    setTimeout(monitor, 2000);
+    setInterval(monitor, CONFIG.checkInterval);
+
+})();
